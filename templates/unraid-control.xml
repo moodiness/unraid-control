@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Container version="2">
+  <Name>Unraid-Control</Name>
+  <Repository>ghcr.io/moodiness/unraid-control:latest</Repository>
+  <Registry>https://github.com/moodiness/unraid-control/pkgs/container/unraid-control</Registry>
+  <Network>bridge</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/moodiness/unraid-control/issues</Support>
+  <Project>https://github.com/moodiness/unraid-control</Project>
+  <Overview>[b]Unraid Control[/b] is a secure, self-hosted PWA for monitoring and controlling one or more Unraid servers. It provides dashboards for system metrics, array storage, Docker containers, virtual machines, shares, files, notifications, and logs.[br][br][b]First run:[/b] Set a unique local password below. Open the WebUI, then add your Unraid server URL and API key. SSH/SFTP can be configured later in the application for logs and file access.</Overview>
+  <Description>Responsive self-hosted PWA for monitoring and controlling Unraid servers through GraphQL and optional SSH/SFTP.</Description>
+  <Category>Tools: Status: Network:Management</Category>
+  <WebUI>http://[IP]:[PORT:3001]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/moodiness/unraid-control/main/templates/unraid-control.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/moodiness/unraid-control/main/templates/unraid-control.png</Icon>
+  <ExtraParams>--user=99:100 --security-opt=no-new-privileges:true --cap-drop=ALL</ExtraParams>
+  <PostArgs/>
+  <Requires>An Unraid server with an accessible GraphQL API and API key. SSH is optional.</Requires>
+  <Config Name="Web UI Port" Target="3001" Default="2442" Mode="tcp" Description="Host port used to access the Unraid Control web interface." Type="Port" Display="always" Required="true" Mask="false">2442</Config>
+  <Config Name="Appdata" Target="/data" Default="/mnt/user/appdata/unraid-control" Mode="rw" Description="Persistent encrypted server configuration, encryption key, and audit log." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/unraid-control</Config>
+  <Config Name="Local UI Password" Target="LOCAL_AUTH_PASSWORD" Default="" Mode="" Description="Unique password used to unlock the application. Minimum 12 characters. Changing it invalidates existing sessions." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Time Zone" Target="TZ" Default="Etc/UTC" Mode="" Description="Container time zone, for example Europe/Paris or America/New_York." Type="Variable" Display="always" Required="true" Mask="false">Etc/UTC</Config>
+  <Config Name="Encryption Key" Target="ARRAY_ENCRYPTION_KEY" Default="" Mode="" Description="Optional 32-byte key encoded as base64 or 64 hexadecimal characters. Leave empty to generate and persist a private key in Appdata." Type="Variable" Display="advanced" Required="false" Mask="true"/>
+  <Config Name="Maximum Upload Size" Target="MAX_UPLOAD_BYTES" Default="2147483648" Mode="" Description="Maximum SFTP upload size in bytes. The default is 2 GiB." Type="Variable" Display="advanced" Required="false" Mask="false">2147483648</Config>
+  <Config Name="Trust Reverse Proxy" Target="TRUST_PROXY" Default="false" Mode="" Description="Set to true only when the application runs behind a trusted reverse proxy." Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+  <Config Name="GraphQL Schema URL" Target="UNRAID_SCHEMA_URL" Default="" Mode="" Description="Optional official Unraid GraphQL schema URL override. Leave empty for automatic selection." Type="Variable" Display="advanced-hide" Required="false" Mask="false"/>
+</Container>

@@ -1,0 +1,23 @@
+services:
+  unraid:
+    container_name: unraid-control
+    image: "${UNRAID_IMAGE:-ghcr.io/moodiness/unraid-control:latest}"
+    restart: unless-stopped
+    user: "${PUID:-99}:${PGID:-100}"
+    ports:
+      - "${UNRAID_APP_PORT:-2442}:3001"
+    environment:
+      PORT: 3001
+      DATA_DIR: /data
+      LOCAL_AUTH_PASSWORD: "${LOCAL_AUTH_PASSWORD:?Set LOCAL_AUTH_PASSWORD in .env}"
+      ARRAY_ENCRYPTION_KEY: "${ARRAY_ENCRYPTION_KEY:-}"
+      MAX_UPLOAD_BYTES: "${MAX_UPLOAD_BYTES:-2147483648}"
+      TRUST_PROXY: "${TRUST_PROXY:-false}"
+      UNRAID_SCHEMA_URL: "${UNRAID_SCHEMA_URL:-}"
+      TZ: "${TZ:-UTC}"
+    volumes:
+      - "${APPDATA_PATH:-./data}:/data"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

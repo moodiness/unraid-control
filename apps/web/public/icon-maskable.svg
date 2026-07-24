@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Unraid">
+  <defs>
+    <linearGradient id="unraid-maskable" x1="70" y1="32" x2="448" y2="490" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ff9a4d"/>
+      <stop offset="0.5" stop-color="#ff6b38"/>
+      <stop offset="1" stop-color="#f3325c"/>
+    </linearGradient>
+    <radialGradient id="maskable-highlight" cx="0" cy="0" r="1" gradientTransform="translate(116 70) rotate(45) scale(310)">
+      <stop stop-color="#fff" stop-opacity="0.2"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" fill="url(#unraid-maskable)"/>
+  <rect width="512" height="512" fill="url(#maskable-highlight)"/>
+  <g fill="#fff" transform="translate(70 148) scale(1.7)">
+    <path d="M104 32h10.8v64H104V32ZM10.8 96H0V32h10.7v64ZM52.1 103.6h10.7V128H52v-24.4ZM26 76h10.6v39.6H26V76.1ZM78 76h10.7v39.6H78V76.1ZM208.3 32H219v64h-10.7V32ZM167 24.4h-10.7V0H167v24.4ZM193 51.7h-10.6V12.3H193v39.4ZM140.9 51.7h-10.7V12.3h10.7v39.4Z"/>
+  </g>
+</svg>
