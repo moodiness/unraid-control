@@ -9,8 +9,8 @@ export default defineConfig({
       registerType: "autoUpdate",
       includeAssets: ["icon.svg"],
       manifest: {
-        name: "Unraid",
-        short_name: "Unraid",
+        name: "Unraid Control",
+        short_name: "Unraid Control",
         description:
           "A private, self-hosted control center for your Unraid server.",
         theme_color: "#0b0b12",

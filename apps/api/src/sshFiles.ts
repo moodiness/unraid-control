@@ -113,6 +113,20 @@ function permissions(mode: number) {
   return (mode & 0o777).toString(8).padStart(3, "0");
 }
 
+export function normalizeSshConnectionError(error: Error) {
+  const level = (error as Error & { level?: string }).level;
+  if (
+    level === "client-authentication" ||
+    /all configured authentication methods failed/i.test(error.message)
+  ) {
+    return new Error(
+      "SSH authentication failed. Verify the username and password, then confirm SSH access is enabled in Unraid.",
+      { cause: error },
+    );
+  }
+  return error;
+}
+
 export async function openSftp(
   config: SshConfig,
   allowUnknownHost = false,
@@ -123,7 +137,7 @@ export async function openSftp(
   const deferred = Promise.withResolvers<SftpSession>();
   const fail = (error: Error) => {
     client.end();
-    deferred.reject(error);
+    deferred.reject(normalizeSshConnectionError(error));
   };
   client.once("error", fail);
   client.once("ready", () => {
@@ -133,11 +147,21 @@ export async function openSftp(
       deferred.resolve({ client, sftp, fingerprint: observedFingerprint });
     });
   });
+  const password = config.authType === "password" ? config.password : undefined;
+  if (password) {
+    client.on(
+      "keyboard-interactive",
+      (_name, _instructions, _language, prompts, finish) => {
+        finish(prompts.map(() => password));
+      },
+    );
+  }
   client.connect({
     host: config.host,
     port: config.port,
     username: config.username,
-    password: config.authType === "password" ? config.password : undefined,
+    password,
+    tryKeyboard: Boolean(password),
     privateKey:
       config.authType === "privateKey" ? config.privateKey : undefined,
     passphrase:

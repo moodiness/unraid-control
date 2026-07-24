@@ -13,10 +13,14 @@ test("accepts valid sessions and rejects expired or modified tokens", () => {
   const now = 1_750_000_000_000;
   const auth = createLocalAuth("correct horse battery staple");
   const token = auth.createSession(now, 60_000);
+  const replacement = token.endsWith("x") ? "y" : "x";
 
   assert.equal(auth.verifySession(token, now), true);
   assert.equal(auth.verifySession(token, now + 60_001), false);
-  assert.equal(auth.verifySession(`${token.slice(0, -1)}x`, now), false);
+  assert.equal(
+    auth.verifySession(`${token.slice(0, -1)}${replacement}`, now),
+    false,
+  );
   assert.equal(
     createLocalAuth("a different secure password").verifySession(token, now),
     false,

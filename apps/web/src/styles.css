@@ -105,6 +105,13 @@
     ::picker(select) {
       appearance: base-select;
     }
+    .setup-card select {
+      align-items: center;
+      line-height: 1.2;
+    }
+    .setup-card select::picker-icon {
+      align-self: center;
+    }
     ::picker(select) {
       max-height: min(420px, 70dvh);
       padding: 4px;

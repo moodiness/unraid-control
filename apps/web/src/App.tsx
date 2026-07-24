@@ -3184,7 +3184,9 @@ function ControlApp({ onLogout }: { onLogout: () => Promise<void> }) {
     url.searchParams.set("view", view);
     window.history.replaceState(null, "", url);
     document.title =
-      view === "dashboard" ? "Unraid" : `Unraid · ${t(VIEW_META[view].label)}`;
+      view === "dashboard"
+        ? "Unraid Control"
+        : `Unraid Control · ${t(VIEW_META[view].label)}`;
   }, [view, language]);
 
   useEffect(() => {
