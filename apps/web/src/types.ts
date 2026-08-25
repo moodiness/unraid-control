@@ -16,6 +16,11 @@ export type SshSettingsInput = Omit<SshSettings, "configured"> & {
   privateKey?: string;
   passphrase?: string;
 };
+export type SshTestResult = {
+  ok: true;
+  fingerprint: string;
+  verified: boolean;
+};
 export type ServerSummary = {
   id: string;
   name: string;

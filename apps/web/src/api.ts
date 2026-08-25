@@ -7,6 +7,7 @@ import type {
   ServerLogSource,
   ServerLogSourceOption,
   SshSettingsInput,
+  SshTestResult,
 } from "./types";
 
 export const AUTH_REQUIRED_EVENT = "unraid-auth-required";
@@ -59,10 +60,10 @@ export const api = {
     }),
   config: () => request<ServerConfig>("/api/config"),
   dashboard: () => request<Dashboard>("/api/dashboard"),
-  test: (config: ServerPayload & { apiKey: string }) =>
+  test: (config: ServerPayload, serverId?: string) =>
     request<{ ok: true; hostname?: string }>("/api/config/test", {
       method: "POST",
-      body: JSON.stringify(config),
+      body: JSON.stringify({ ...config, serverId }),
     }),
   save: (config: ServerPayload & { apiKey: string }) =>
     request<ServerConfig>("/api/config", {
@@ -84,7 +85,7 @@ export const api = {
       method: "DELETE",
     }),
   testSsh: (config: SshSettingsInput, serverId?: string) =>
-    request<{ ok: true; fingerprint: string }>("/api/ssh/test", {
+    request<SshTestResult>("/api/ssh/test", {
       method: "POST",
       body: JSON.stringify({ ...config, serverId }),
     }),

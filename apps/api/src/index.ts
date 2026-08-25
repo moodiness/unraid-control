@@ -4,7 +4,14 @@ import {
   randomBytes,
   randomUUID,
 } from "node:crypto";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import {
+  appendFile,
+  mkdir,
+  readFile,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { isIP } from "node:net";
 import { dirname, join, resolve } from "node:path";
@@ -21,6 +28,7 @@ import { z } from "zod";
 import { calculateDiskIoRates } from "./diskIo.js";
 import {
   completeSshConfig,
+  discoverSshFingerprint,
   createFolder,
   deleteFile,
   downloadFile,
@@ -58,11 +66,20 @@ const dataDir = resolve(process.env.DATA_DIR ?? join(process.cwd(), "data"));
 const configFile = join(dataDir, "server.enc.json");
 const keyFile = join(dataDir, ".array-key");
 const auditFile = join(dataDir, "audit.log");
+const maxUploadBytes = Number(
+  process.env.MAX_UPLOAD_BYTES ?? 2 * 1_024 * 1_024 * 1_024,
+);
+if (!Number.isSafeInteger(maxUploadBytes) || maxUploadBytes <= 0) {
+  throw new Error("MAX_UPLOAD_BYTES must be a positive safe integer");
+}
 const webDir = resolve(
   dirname(fileURLToPath(import.meta.url)),
   "../../web/dist",
 );
-const localAuth = createLocalAuth(process.env.LOCAL_AUTH_PASSWORD ?? "");
+const localAuth = createLocalAuth(
+  process.env.LOCAL_AUTH_PASSWORD ?? "",
+  await encryptionKey(),
+);
 
 const ServerInput = z.object({
   name: z.string().trim().min(1).max(48),
@@ -80,6 +97,9 @@ const ServerInput = z.object({
 const ServerUpdateInput = ServerInput.extend({
   apiKey: ServerInput.shape.apiKey.optional(),
 });
+const ServerTestInput = ServerUpdateInput.extend({
+  serverId: z.string().uuid().optional(),
+});
 
 type ServerConfig = z.infer<typeof ServerInput>;
 type StoredServer = ServerConfig & { id: string };
@@ -96,6 +116,7 @@ const normalizeBaseUrl = (value: string) =>
     .trim()
     .replace(/\/+$/, "")
     .replace(/\/graphql$/, "");
+const canonicalOrigin = (value: string) => new URL(value).origin;
 const endpointFor = (config: ServerConfig) =>
   `${normalizeBaseUrl(config.baseUrl)}/graphql`;
 
@@ -131,7 +152,25 @@ async function saveStore(store: ServerStore) {
     tag: cipher.getAuthTag().toString("base64"),
     ciphertext: ciphertext.toString("base64"),
   };
-  await writeFile(configFile, JSON.stringify(envelope), { mode: 0o600 });
+  const temporaryFile = `${configFile}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryFile, JSON.stringify(envelope), {
+      flag: "wx",
+      mode: 0o600,
+      flush: true,
+    });
+    await rename(temporaryFile, configFile);
+  } catch (error) {
+    try {
+      await rm(temporaryFile, { force: true });
+    } catch (cleanupError) {
+      throw new AggregateError(
+        [error, cleanupError],
+        "Failed to save server store and clean its temporary file",
+      );
+    }
+    throw error;
+  }
 }
 
 async function loadStore(): Promise<ServerStore> {
@@ -160,6 +199,23 @@ async function loadStore(): Promise<ServerStore> {
       id: z.string().uuid().parse(server.id),
     })),
   };
+}
+let storeMutationTail = Promise.resolve();
+
+async function withStoreMutation<T>(
+  transaction: (store: ServerStore) => Promise<T>,
+): Promise<T> {
+  const previous = storeMutationTail;
+  let release!: () => void;
+  storeMutationTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await transaction(await loadStore());
+  } finally {
+    release();
+  }
 }
 
 const agents = new Map<boolean, Agent>();
@@ -822,9 +878,6 @@ const VmIconParams = z.object({
         ),
     ),
 });
-const maxUploadBytes = Number(
-  process.env.MAX_UPLOAD_BYTES ?? 2 * 1_024 * 1_024 * 1_024,
-);
 
 async function activeSsh() {
   const store = await loadStore();
@@ -919,7 +972,21 @@ app.post(
   "/api/config/test",
   writeLimiter,
   asyncRoute(async (req, res) => {
-    const config = ServerInput.parse(req.body);
+    const { serverId, ...input } = ServerTestInput.parse(req.body);
+    let apiKey = input.apiKey;
+    if (!apiKey) {
+      const store = serverId ? await loadStore() : undefined;
+      const current = store?.servers.find((server) => server.id === serverId);
+      if (!current)
+        return void res.status(400).json({ error: "An API key is required" });
+      if (canonicalOrigin(input.baseUrl) !== canonicalOrigin(current.baseUrl)) {
+        return void res.status(400).json({
+          error: "A new API key is required when the server origin changes",
+        });
+      }
+      apiKey = current.apiKey;
+    }
+    const config: ServerConfig = { ...input, apiKey };
     const data = await graphQL<{ info: { os: { hostname: string | null } } }>(
       config,
       `query Test { info { os { hostname } } }`,
@@ -932,22 +999,28 @@ app.post(
   writeLimiter,
   asyncRoute(async (req, res) => {
     const { serverId, ...input } = SshTestInput.parse(req.body);
+    if (!input.hostFingerprint) {
+      const result = await discoverSshFingerprint({
+        ...input,
+        password: undefined,
+        privateKey: undefined,
+        passphrase: undefined,
+      });
+      return void res.json({
+        ok: true,
+        fingerprint: result.fingerprint,
+        verified: false,
+      });
+    }
+
     const store = serverId ? await loadStore() : undefined;
     const current = store?.servers.find(
       (server) => server.id === serverId,
     )?.ssh;
-    const config: SshConfig = {
-      ...input,
-      password: input.password || current?.password,
-      privateKey: input.privateKey || current?.privateKey,
-      passphrase: input.passphrase || current?.passphrase,
-    };
-    if (config.authType === "password" && !config.password)
-      throw new Error("An SSH password is required");
-    if (config.authType === "privateKey" && !config.privateKey)
-      throw new Error("An SSH private key is required");
+    const config = completeSshConfig(input, current);
+    if (!config) throw new Error("SSH configuration is required");
     const result = await testSsh(config);
-    res.json({ ok: true, fingerprint: result.fingerprint });
+    res.json({ ok: true, fingerprint: result.fingerprint, verified: true });
   }),
 );
 app.post(
@@ -961,20 +1034,25 @@ app.post(
       ssh: completeSshConfig(input.ssh),
     };
     await graphQL(config, `query Test { online }`);
-    const store = await loadStore();
-    if (
-      store.servers.some(
-        (server) => normalizeBaseUrl(server.baseUrl) === config.baseUrl,
-      )
-    ) {
+    const store = await withStoreMutation(async (store) => {
+      if (
+        store.servers.some(
+          (server) => normalizeBaseUrl(server.baseUrl) === config.baseUrl,
+        )
+      ) {
+        return null;
+      }
+      const server: StoredServer = { ...config, id: randomUUID() };
+      store.servers.push(server);
+      store.activeServerId = server.id;
+      await saveStore(store);
+      return store;
+    });
+    if (!store) {
       return void res
         .status(409)
         .json({ error: "This server is already configured" });
     }
-    const server: StoredServer = { ...config, id: randomUUID() };
-    store.servers.push(server);
-    store.activeServerId = server.id;
-    await saveStore(store);
     dashboardCache = null;
     res.status(201).json(publicConfig(store));
   }),
@@ -984,11 +1062,13 @@ app.patch(
   writeLimiter,
   asyncRoute(async (req, res) => {
     const id = z.object({ id: z.string().uuid() }).parse(req.body).id;
-    const store = await loadStore();
-    if (!store.servers.some((server) => server.id === id))
-      return void res.status(404).json({ error: "Server not found" });
-    store.activeServerId = id;
-    await saveStore(store);
+    const store = await withStoreMutation(async (store) => {
+      if (!store.servers.some((server) => server.id === id)) return null;
+      store.activeServerId = id;
+      await saveStore(store);
+      return store;
+    });
+    if (!store) return void res.status(404).json({ error: "Server not found" });
     dashboardCache = null;
     res.json(publicConfig(store));
   }),
@@ -999,43 +1079,84 @@ app.patch(
   asyncRoute(async (req, res) => {
     const id = z.string().uuid().parse(req.params.id);
     const input = ServerUpdateInput.parse(req.body);
-    const store = await loadStore();
-    const index = store.servers.findIndex((server) => server.id === id);
-    if (index === -1)
-      return void res.status(404).json({ error: "Server not found" });
+    let testedConnection:
+      Pick<StoredServer, "baseUrl" | "apiKey" | "allowSelfSigned"> | undefined;
+    const result = await (async () => {
+      for (;;) {
+        const outcome = await withStoreMutation(async (store) => {
+          const index = store.servers.findIndex((server) => server.id === id);
+          if (index === -1) return { status: "not-found" as const };
 
-    const current = store.servers[index]!;
-    const next: StoredServer = {
-      ...current,
-      ...input,
-      id,
-      baseUrl: normalizeBaseUrl(input.baseUrl),
-      apiKey: input.apiKey ?? current.apiKey,
-      ssh: input.ssh ? completeSshConfig(input.ssh, current.ssh) : current.ssh,
-    };
-    if (
-      store.servers.some(
-        (server) =>
-          server.id !== id && normalizeBaseUrl(server.baseUrl) === next.baseUrl,
-      )
-    ) {
+          const current = store.servers[index]!;
+          const baseUrl = normalizeBaseUrl(input.baseUrl);
+          if (
+            canonicalOrigin(baseUrl) !== canonicalOrigin(current.baseUrl) &&
+            !input.apiKey
+          ) {
+            return { status: "new-api-key-required" as const };
+          }
+          const next: StoredServer = {
+            ...current,
+            ...input,
+            id,
+            baseUrl,
+            apiKey: input.apiKey ?? current.apiKey,
+            ssh: input.ssh
+              ? completeSshConfig(input.ssh, current.ssh)
+              : current.ssh,
+          };
+          if (
+            store.servers.some(
+              (server) =>
+                server.id !== id &&
+                normalizeBaseUrl(server.baseUrl) === next.baseUrl,
+            )
+          ) {
+            return { status: "duplicate" as const };
+          }
+
+          const connectionChanged =
+            next.baseUrl !== current.baseUrl ||
+            next.apiKey !== current.apiKey ||
+            next.allowSelfSigned !== current.allowSelfSigned;
+          const connectionWasTested =
+            testedConnection !== undefined &&
+            testedConnection.baseUrl === next.baseUrl &&
+            testedConnection.apiKey === next.apiKey &&
+            testedConnection.allowSelfSigned === next.allowSelfSigned;
+          if (connectionChanged && !connectionWasTested) {
+            return { status: "test-required" as const, next };
+          }
+
+          store.servers[index] = next;
+          await saveStore(store);
+          return { status: "updated" as const, store, connectionChanged };
+        });
+        if (outcome.status !== "test-required") return outcome;
+        await graphQL(outcome.next, `query Test { online }`);
+        testedConnection = {
+          baseUrl: outcome.next.baseUrl,
+          apiKey: outcome.next.apiKey,
+          allowSelfSigned: outcome.next.allowSelfSigned,
+        };
+      }
+    })();
+    if (result.status === "not-found")
+      return void res.status(404).json({ error: "Server not found" });
+    if (result.status === "new-api-key-required") {
+      return void res.status(400).json({
+        error: "A new API key is required when the server origin changes",
+      });
+    }
+    if (result.status === "duplicate") {
       return void res
         .status(409)
         .json({ error: "This server is already configured" });
     }
-
-    const connectionChanged =
-      next.baseUrl !== current.baseUrl ||
-      next.apiKey !== current.apiKey ||
-      next.allowSelfSigned !== current.allowSelfSigned;
-    if (connectionChanged) await graphQL(next, `query Test { online }`);
-    if (connectionChanged) schemaCapabilitiesCache.delete(id);
-
-    store.servers[index] = next;
-    await saveStore(store);
+    if (result.connectionChanged) schemaCapabilitiesCache.delete(id);
     dashboardCache = null;
     diskIoSamples.delete(id);
-    res.json(publicConfig(store));
+    res.json(publicConfig(result.store));
   }),
 );
 app.delete(
@@ -1043,13 +1164,15 @@ app.delete(
   writeLimiter,
   asyncRoute(async (req, res) => {
     const id = z.string().uuid().parse(req.params.id);
-    const store = await loadStore();
-    store.servers = store.servers.filter((server) => server.id !== id);
+    const store = await withStoreMutation(async (store) => {
+      store.servers = store.servers.filter((server) => server.id !== id);
+      if (store.activeServerId === id)
+        store.activeServerId = store.servers[0]?.id ?? null;
+      await saveStore(store);
+      return store;
+    });
     schemaCapabilitiesCache.delete(id);
     diskIoSamples.delete(id);
-    if (store.activeServerId === id)
-      store.activeServerId = store.servers[0]?.id ?? null;
-    await saveStore(store);
     dashboardCache = null;
     res.json(publicConfig(store));
   }),

@@ -381,6 +381,13 @@ function hostnameFromUrl(value: string) {
     return "";
   }
 }
+function canonicalOrigin(value: string) {
+  try {
+    return new URL(value).origin;
+  } catch {
+    return null;
+  }
+}
 function dockerObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -561,7 +568,7 @@ function Setup({
   const [baseUrl, setBaseUrl] = useState(server?.baseUrl ?? "");
   const [apiKey, setApiKey] = useState("");
   const [allowSelfSigned, setAllowSelfSigned] = useState(
-    server?.allowSelfSigned ?? true,
+    server?.allowSelfSigned ?? false,
   );
   const currentSsh = server?.ssh;
   const [sshEnabled, setSshEnabled] = useState(currentSsh?.enabled ?? false);
@@ -584,11 +591,34 @@ function Setup({
   const [sshFingerprint, setSshFingerprint] = useState(
     currentSsh?.hostFingerprint ?? "",
   );
+  const [sshVerified, setSshVerified] = useState(
+    Boolean(currentSsh?.configured),
+  );
+  const sshVerificationGeneration = useRef(0);
+  const invalidateSshVerification = () => {
+    sshVerificationGeneration.current += 1;
+    setSshVerified(false);
+  };
   const [busy, setBusy] = useState<"test" | "ssh" | "save" | null>(null);
   const [message, setMessage] = useState<{
     text: string;
     error?: boolean;
   } | null>(null);
+  const originChanged = Boolean(
+    server && canonicalOrigin(baseUrl) !== canonicalOrigin(server.baseUrl),
+  );
+  const canReuseStoredSshSecret = Boolean(
+    currentSsh?.configured &&
+    sshHost.trim() === currentSsh.host &&
+    Number(sshPort) === currentSsh.port &&
+    sshUsername.trim() === currentSsh.username &&
+    sshAuthType === currentSsh.authType &&
+    sshFingerprint === currentSsh.hostFingerprint,
+  );
+  const hasSshCredential =
+    sshAuthType === "password"
+      ? Boolean(sshPassword || canReuseStoredSshSecret)
+      : Boolean(sshPrivateKey || canReuseStoredSshSecret);
   const sshPayload: SshSettingsInput | undefined =
     sshEnabled || currentSsh
       ? {
@@ -597,9 +627,12 @@ function Setup({
           port: Number(sshPort),
           username: sshUsername,
           authType: sshAuthType,
-          password: sshPassword || undefined,
-          privateKey: sshPrivateKey || undefined,
-          passphrase: sshPassphrase || undefined,
+          ...(sshAuthType === "password"
+            ? { password: sshPassword || undefined }
+            : {
+                privateKey: sshPrivateKey || undefined,
+                passphrase: sshPassphrase || undefined,
+              }),
           rootPath: sshRootPath,
           hostFingerprint: sshFingerprint || undefined,
         }
@@ -616,10 +649,17 @@ function Setup({
     if (!sshPayload) return;
     setBusy("ssh");
     setMessage(null);
+    const generation = sshVerificationGeneration.current;
     try {
       const result = await api.testSsh(sshPayload, server?.id);
+      if (generation !== sshVerificationGeneration.current) return;
       setSshFingerprint(result.fingerprint);
-      setMessage({ text: "SSH connection verified." });
+      setSshVerified(result.verified);
+      setMessage({
+        text: result.verified
+          ? `SSH authentication verified for host key ${result.fingerprint}.`
+          : `Discovered SSH host key ${result.fingerprint}. Review this fingerprint, then select Confirm & verify SSH to authenticate.`,
+      });
     } catch (error) {
       setMessage({
         text: error instanceof Error ? error.message : "SSH connection failed",
@@ -634,7 +674,10 @@ function Setup({
     setBusy("test");
     setMessage(null);
     try {
-      const result = await api.test(payload);
+      const result = await api.test(
+        { ...payload, apiKey: apiKey || undefined },
+        server?.id,
+      );
       setMessage({
         text: result.hostname
           ? `Connected to ${result.hostname}.`
@@ -652,6 +695,13 @@ function Setup({
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
+    if (sshEnabled && !sshVerified) {
+      setMessage({
+        text: "Discover the SSH host key, confirm its fingerprint, and verify authentication before saving.",
+        error: true,
+      });
+      return;
+    }
     setBusy("save");
     setMessage(null);
     try {
@@ -726,6 +776,7 @@ function Setup({
               <input
                 value={baseUrl}
                 onChange={(event) => setBaseUrl(event.target.value)}
+                type="url"
                 placeholder="http://192.168.1.10"
                 inputMode="url"
                 autoComplete="url"
@@ -742,18 +793,20 @@ function Setup({
                 value={apiKey}
                 onChange={(event) => setApiKey(event.target.value)}
                 placeholder={
-                  server
+                  server && !originChanged
                     ? "Leave blank to keep the current key."
                     : "unraid_xxxxxxxxx"
                 }
                 type="password"
                 autoComplete="off"
-                required={!server}
+                required={!server || originChanged}
                 minLength={8}
               />
               {server && (
                 <small className="setup-field-hint">
-                  Leave blank to keep the current key.
+                  {originChanged
+                    ? "The server origin changed. Enter a new API key; the stored key will never be sent to the new origin."
+                    : "Leave blank to keep the current key for this server origin."}
                 </small>
               )}
             </label>
@@ -764,8 +817,12 @@ function Setup({
                 onChange={(event) => setAllowSelfSigned(event.target.checked)}
               />
               <span>
-                <strong>Allow a self-signed certificate</strong>
-                <small>Recommended for a local HTTPS connection.</small>
+                <strong>Allow an untrusted or self-signed certificate</strong>
+                <small>
+                  {allowSelfSigned
+                    ? "Warning: certificate verification is disabled for this server. Only enable this if you trust its network and certificate."
+                    : "Keep disabled to verify the server certificate."}
+                </small>
               </span>
             </label>
             <section className={`ssh-setup ${sshEnabled ? "is-enabled" : ""}`}>
@@ -776,6 +833,7 @@ function Setup({
                   onChange={(event) => {
                     const enabled = event.target.checked;
                     setSshEnabled(enabled);
+                    invalidateSshVerification();
                     if (enabled && !sshHost)
                       setSshHost(hostnameFromUrl(baseUrl));
                   }}
@@ -800,6 +858,7 @@ function Setup({
                         onChange={(event) => {
                           setSshHost(event.target.value);
                           setSshFingerprint("");
+                          invalidateSshVerification();
                         }}
                         placeholder="192.168.1.10"
                         autoComplete="url"
@@ -810,7 +869,11 @@ function Setup({
                       <span>Port</span>
                       <input
                         value={sshPort}
-                        onChange={(event) => setSshPort(event.target.value)}
+                        onChange={(event) => {
+                          setSshPort(event.target.value);
+                          setSshFingerprint("");
+                          invalidateSshVerification();
+                        }}
                         type="number"
                         min="1"
                         max="65535"
@@ -824,7 +887,11 @@ function Setup({
                       <span>Username</span>
                       <input
                         value={sshUsername}
-                        onChange={(event) => setSshUsername(event.target.value)}
+                        onChange={(event) => {
+                          setSshUsername(event.target.value);
+                          setSshFingerprint("");
+                          invalidateSshVerification();
+                        }}
                         placeholder="root"
                         autoComplete="username"
                         required
@@ -839,6 +906,7 @@ function Setup({
                             event.target.value as "password" | "privateKey",
                           );
                           setSshFingerprint("");
+                          invalidateSshVerification();
                         }}
                       >
                         <option value="password">Password</option>
@@ -853,16 +921,16 @@ function Setup({
                         value={sshPassword}
                         onChange={(event) => {
                           setSshPassword(event.target.value);
-                          setSshFingerprint("");
+                          invalidateSshVerification();
                         }}
                         type="password"
                         autoComplete="off"
                         placeholder={
-                          currentSsh?.configured
+                          canReuseStoredSshSecret
                             ? "Leave blank to keep the current password."
                             : "SSH password"
                         }
-                        required={!currentSsh?.configured}
+                        required={!canReuseStoredSshSecret}
                       />
                     </label>
                   ) : (
@@ -873,25 +941,26 @@ function Setup({
                           value={sshPrivateKey}
                           onChange={(event) => {
                             setSshPrivateKey(event.target.value);
-                            setSshFingerprint("");
+                            invalidateSshVerification();
                           }}
                           rows={4}
                           autoComplete="off"
                           placeholder={
-                            currentSsh?.configured
+                            canReuseStoredSshSecret
                               ? "Leave blank to keep the current key."
                               : "-----BEGIN OPENSSH PRIVATE KEY-----"
                           }
-                          required={!currentSsh?.configured}
+                          required={!canReuseStoredSshSecret}
                         />
                       </label>
                       <label>
                         <span>Key passphrase (optional)</span>
                         <input
                           value={sshPassphrase}
-                          onChange={(event) =>
-                            setSshPassphrase(event.target.value)
-                          }
+                          onChange={(event) => {
+                            setSshPassphrase(event.target.value);
+                            invalidateSshVerification();
+                          }}
                           type="password"
                           autoComplete="off"
                         />
@@ -902,12 +971,16 @@ function Setup({
                     <span>Start folder</span>
                     <input
                       value={sshRootPath}
-                      onChange={(event) => setSshRootPath(event.target.value)}
+                      onChange={(event) => {
+                        setSshRootPath(event.target.value);
+                        invalidateSshVerification();
+                      }}
                       placeholder="/mnt/user"
                       required
                     />
                     <small className="setup-field-hint">
-                      Access is confined to this folder and its descendants.
+                      Paths are checked against this folder. For strong
+                      isolation, use a restricted SFTP account.
                     </small>
                   </label>
                   <div className="ssh-test-row">
@@ -915,18 +988,27 @@ function Setup({
                       className="button secondary"
                       type="button"
                       onClick={testSshConnection}
-                      disabled={busy !== null || !sshHost || !sshUsername}
+                      disabled={
+                        busy !== null ||
+                        !sshHost ||
+                        !sshUsername ||
+                        (Boolean(sshFingerprint) && !hasSshCredential)
+                      }
                     >
                       {busy === "ssh" ? (
                         <RefreshCw className="spin" size={17} />
                       ) : (
                         <KeyRound size={17} />
                       )}
-                      Verify SSH
+                      {sshVerified
+                        ? "Verify SSH again"
+                        : sshFingerprint
+                          ? "Confirm & verify SSH"
+                          : "Discover SSH host key"}
                     </button>
                     {sshFingerprint && (
                       <small className="ssh-fingerprint">
-                        Host key {sshFingerprint}
+                        SSH host key fingerprint: {sshFingerprint}
                       </small>
                     )}
                   </div>
@@ -936,6 +1018,7 @@ function Setup({
             {message && (
               <div
                 className={`form-message ${message.error ? "is-error" : "is-success"}`}
+                role={message.error ? "alert" : "status"}
               >
                 {message.error ? (
                   <AlertTriangle size={16} />
@@ -959,7 +1042,11 @@ function Setup({
                 className="button secondary"
                 type="button"
                 onClick={testConnection}
-                disabled={busy !== null || !baseUrl || !apiKey}
+                disabled={
+                  busy !== null ||
+                  !baseUrl ||
+                  (!apiKey && (!server || originChanged))
+                }
               >
                 {busy === "test" ? (
                   <RefreshCw className="spin" size={17} />

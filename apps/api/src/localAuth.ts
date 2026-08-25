@@ -9,7 +9,7 @@ export const AUTH_COOKIE_NAME = "unraid_session";
 export const AUTH_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 
 const PASSWORD_SALT = "unraid-control:password:v1";
-const SESSION_SALT = "unraid-control:session:v1";
+const SESSION_KEY_CONTEXT = "unraid-control:session:v1\0";
 
 function digest(value: string, salt: string) {
   return scryptSync(value, salt, 32);
@@ -19,13 +19,16 @@ function safeEqual(left: Buffer, right: Buffer) {
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
-export function createLocalAuth(password: string) {
+export function createLocalAuth(password: string, sessionSecret: Buffer) {
   if (password.length < 12) {
     throw new Error("LOCAL_AUTH_PASSWORD must contain at least 12 characters");
   }
 
   const passwordDigest = digest(password, PASSWORD_SALT);
-  const sessionKey = digest(password, SESSION_SALT);
+  const sessionKey = createHmac("sha256", sessionSecret)
+    .update(SESSION_KEY_CONTEXT)
+    .update(password)
+    .digest();
 
   const sign = (payload: string) =>
     createHmac("sha256", sessionKey).update(payload).digest();

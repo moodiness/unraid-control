@@ -1,6 +1,7 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { posix } from "node:path";
 import type { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import {
   Client,
   type FileEntryWithStats,
@@ -77,9 +78,19 @@ export function completeSshConfig(
     };
   if (!input.hostFingerprint)
     throw new Error("Test the SSH connection before saving it");
-  const password = input.password || current?.password;
-  const privateKey = input.privateKey || current?.privateKey;
-  const passphrase = input.passphrase || current?.passphrase;
+  const canReuseSecrets =
+    current !== undefined &&
+    input.host === current.host &&
+    input.port === current.port &&
+    input.username === current.username &&
+    input.authType === current.authType &&
+    input.hostFingerprint === current.hostFingerprint;
+  const password =
+    input.password ?? (canReuseSecrets ? current.password : undefined);
+  const privateKey =
+    input.privateKey ?? (canReuseSecrets ? current.privateKey : undefined);
+  const passphrase =
+    input.passphrase ?? (canReuseSecrets ? current.passphrase : undefined);
   if (input.authType === "password" && !password)
     throw new Error("An SSH password is required");
   if (input.authType === "privateKey" && !privateKey)
@@ -126,26 +137,89 @@ export function normalizeSshConnectionError(error: Error) {
   }
   return error;
 }
+export async function discoverSshFingerprint(config: SshConfig) {
+  if (!config.enabled) throw new Error("SSH file access is not configured");
+  const client = new Client();
+  const deferred = Promise.withResolvers<{ fingerprint: string }>();
+  let observedFingerprint = "";
+  let settled = false;
+  const finish = (error?: Error) => {
+    if (settled) return;
+    settled = true;
+    client.end();
+    if (observedFingerprint) {
+      deferred.resolve({ fingerprint: observedFingerprint });
+      return;
+    }
+    deferred.reject(error ?? new Error("Unable to read the SSH host key"));
+  };
+  client.on("error", finish);
+  client.once("close", () => finish());
+  client.connect({
+    host: config.host,
+    port: config.port,
+    username: config.username,
+    readyTimeout: 12_000,
+    hostVerifier: (key: Buffer) => {
+      observedFingerprint = fingerprint(key);
+      queueMicrotask(() => finish());
+      return false;
+    },
+  });
+  return deferred.promise;
+}
 
-export async function openSftp(
-  config: SshConfig,
-  allowUnknownHost = false,
-): Promise<SftpSession> {
+const SFTP_OPEN_TIMEOUT_MS = 12_000;
+
+export async function openSftp(config: SshConfig): Promise<SftpSession> {
   if (!config.enabled) throw new Error("SSH file access is not configured");
   let observedFingerprint = "";
   const client = new Client();
   const deferred = Promise.withResolvers<SftpSession>();
-  const fail = (error: Error) => {
+  let settled = false;
+  let openingTimer: NodeJS.Timeout | undefined;
+  const clearOpeningTimer = () => {
+    clearTimeout(openingTimer);
+    openingTimer = undefined;
+  };
+  const failOpening = (error: Error) => {
+    if (settled) return;
+    settled = true;
+    clearOpeningTimer();
     client.end();
     deferred.reject(normalizeSshConnectionError(error));
   };
-  client.once("error", fail);
+  const failClosedOpening = () =>
+    failOpening(
+      new Error("SSH connection closed before the SFTP subsystem opened"),
+    );
+  // EventEmitter errors remain handled for the lifetime of the connection. Once
+  // opening has settled, later transport errors are surfaced by active SFTP
+  // operations instead of becoming an uncaught process-level exception.
+  client.on("error", failOpening);
+  client.once("close", failClosedOpening);
+  client.once("end", failClosedOpening);
   client.once("ready", () => {
-    client.removeListener("error", fail);
-    client.sftp((error, sftp) => {
-      if (error) return fail(error);
-      deferred.resolve({ client, sftp, fingerprint: observedFingerprint });
-    });
+    if (settled) return;
+    openingTimer = setTimeout(
+      () => failOpening(new Error("Timed out opening the SFTP subsystem")),
+      SFTP_OPEN_TIMEOUT_MS,
+    );
+    try {
+      client.sftp((error, sftp) => {
+        if (settled) return;
+        if (error) {
+          failOpening(error);
+          return;
+        }
+        settled = true;
+        clearOpeningTimer();
+        sftp.on("error", () => {});
+        deferred.resolve({ client, sftp, fingerprint: observedFingerprint });
+      });
+    } catch (error) {
+      failOpening(error instanceof Error ? error : new Error(String(error)));
+    }
   });
   const password = config.authType === "password" ? config.password : undefined;
   if (password) {
@@ -171,7 +245,7 @@ export async function openSftp(
     keepaliveCountMax: 2,
     hostVerifier: (key: Buffer) => {
       observedFingerprint = fingerprint(key);
-      return allowUnknownHost || observedFingerprint === config.hostFingerprint;
+      return observedFingerprint === config.hostFingerprint;
     },
   });
   return deferred.promise;
@@ -520,16 +594,46 @@ async function confinedExistingPath(
   return candidate;
 }
 
-async function confinedLeafPath(
+type ConfinedLeaf = {
+  path: string;
+  rootLookupPath: string;
+  resolvedRoot: string;
+  parentLookupPath: string;
+  resolvedParent: string;
+};
+
+async function confinedLeaf(
   sftp: SFTPWrapper,
   config: SshConfig,
   path: string,
-) {
+): Promise<ConfinedLeaf> {
   const candidate = absolutePath(config, path);
-  const root = await realpath(sftp, absolutePath(config, "/"));
-  const parent = await realpath(sftp, posix.dirname(candidate));
-  assertInsideRoot(root, parent);
-  return posix.join(parent, posix.basename(candidate));
+  const rootLookupPath = absolutePath(config, "/");
+  const parentLookupPath = posix.dirname(candidate);
+  const resolvedRoot = await realpath(sftp, rootLookupPath);
+  const resolvedParent = await realpath(sftp, parentLookupPath);
+  assertInsideRoot(resolvedRoot, resolvedParent);
+  return {
+    path: posix.join(resolvedParent, posix.basename(candidate)),
+    rootLookupPath,
+    resolvedRoot,
+    parentLookupPath,
+    resolvedParent,
+  };
+}
+
+async function assertConfinementUnchanged(
+  sftp: SFTPWrapper,
+  confinement: ConfinedLeaf,
+) {
+  const currentRoot = await realpath(sftp, confinement.rootLookupPath);
+  const currentParent = await realpath(sftp, confinement.parentLookupPath);
+  if (
+    currentRoot !== confinement.resolvedRoot ||
+    currentParent !== confinement.resolvedParent
+  )
+    throw new Error("The SSH root or destination folder changed during upload");
+  assertInsideRoot(currentRoot, currentParent);
 }
 
 function mkdir(sftp: SFTPWrapper, path: string) {
@@ -556,6 +660,78 @@ function unlink(sftp: SFTPWrapper, path: string) {
   return deferred.promise;
 }
 
+async function installUploadedFile(
+  sftp: SFTPWrapper,
+  from: string,
+  to: string,
+  confinement: ConfinedLeaf,
+) {
+  await assertConfinementUnchanged(sftp, confinement);
+  try {
+    const extensionRename = Promise.withResolvers<void>();
+    sftp.ext_openssh_rename(from, to, (error) =>
+      error ? extensionRename.reject(error) : extensionRename.resolve(),
+    );
+    await extensionRename.promise;
+    return;
+  } catch {
+    // Servers without posix-rename support require the SFTP v3 path below.
+  }
+
+  let initialRenameError: unknown;
+  try {
+    await assertConfinementUnchanged(sftp, confinement);
+    await rename(sftp, from, to);
+    return;
+  } catch (error) {
+    initialRenameError = error;
+  }
+
+  const backupPath = posix.join(
+    posix.dirname(to),
+    `.${posix.basename(to)}.backup-${randomBytes(16).toString("hex")}`,
+  );
+  try {
+    await assertConfinementUnchanged(sftp, confinement);
+    await rename(sftp, to, backupPath);
+  } catch (backupError) {
+    throw new AggregateError(
+      [initialRenameError, backupError],
+      "The uploaded file could not replace its destination",
+    );
+  }
+
+  try {
+    await assertConfinementUnchanged(sftp, confinement);
+    await rename(sftp, from, to);
+  } catch (replacementError) {
+    try {
+      await rename(sftp, backupPath, to);
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [replacementError, rollbackError],
+        "The upload replacement failed and its destination could not be restored",
+      );
+    }
+    throw replacementError;
+  }
+
+  try {
+    await unlink(sftp, backupPath);
+  } catch (cleanupError) {
+    try {
+      await rename(sftp, to, from);
+      await rename(sftp, backupPath, to);
+    } catch (rollbackError) {
+      throw new AggregateError(
+        [cleanupError, rollbackError],
+        "The upload backup could not be removed or restored",
+      );
+    }
+    throw cleanupError;
+  }
+}
+
 function rmdir(sftp: SFTPWrapper, path: string) {
   const deferred = Promise.withResolvers<void>();
   sftp.rmdir(path, (error) =>
@@ -579,7 +755,9 @@ async function removeRecursively(sftp: SFTPWrapper, path: string) {
 }
 
 export async function testSsh(config: SshConfig) {
-  const session = await openSftp(config, !config.hostFingerprint);
+  if (!config.hostFingerprint)
+    throw new Error("Discover and confirm the SSH host fingerprint first");
+  const session = await openSftp(config);
   try {
     await readDirectory(
       session.sftp,
@@ -646,7 +824,7 @@ export async function listFiles(
 export async function createFolder(config: SshConfig, path: string) {
   if (virtualPath(path) === "/") throw new Error("A folder name is required");
   return withSftp(config, async (sftp) =>
-    mkdir(sftp, await confinedLeafPath(sftp, config, path)),
+    mkdir(sftp, (await confinedLeaf(sftp, config, path)).path),
   );
 }
 
@@ -656,8 +834,8 @@ export async function renameFile(config: SshConfig, from: string, to: string) {
   return withSftp(config, async (sftp) =>
     rename(
       sftp,
-      await confinedLeafPath(sftp, config, from),
-      await confinedLeafPath(sftp, config, to),
+      (await confinedLeaf(sftp, config, from)).path,
+      (await confinedLeaf(sftp, config, to)).path,
     ),
   );
 }
@@ -666,7 +844,7 @@ export async function deleteFile(config: SshConfig, path: string) {
   if (virtualPath(path) === "/")
     throw new Error("The SSH root cannot be deleted");
   return withSftp(config, async (sftp) =>
-    removeRecursively(sftp, await confinedLeafPath(sftp, config, path)),
+    removeRecursively(sftp, (await confinedLeaf(sftp, config, path)).path),
   );
 }
 
@@ -677,30 +855,41 @@ export async function uploadFile(
 ) {
   if (virtualPath(path) === "/") throw new Error("A file name is required");
   const session = await openSftp(config);
-  let destinationPath: string;
+  let temporaryPath: string | undefined;
   try {
-    destinationPath = await confinedLeafPath(session.sftp, config, path);
+    const confinement = await confinedLeaf(session.sftp, config, path);
+    const destinationPath = confinement.path;
+    temporaryPath = posix.join(
+      posix.dirname(destinationPath),
+      `.${posix.basename(destinationPath)}.upload-${randomBytes(16).toString("hex")}`,
+    );
+    const destination = session.sftp.createWriteStream(temporaryPath, {
+      flags: "wx",
+      mode: 0o644,
+    });
+    await pipeline(source, destination);
+    await installUploadedFile(
+      session.sftp,
+      temporaryPath,
+      destinationPath,
+      confinement,
+    );
+    temporaryPath = undefined;
   } catch (error) {
-    session.client.end();
+    if (temporaryPath) {
+      try {
+        await unlink(session.sftp, temporaryPath);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "The upload failed and its temporary file could not be removed",
+        );
+      }
+    }
     throw error;
-  }
-  const deferred = Promise.withResolvers<void>();
-  const destination = session.sftp.createWriteStream(destinationPath, {
-    flags: "w",
-    mode: 0o644,
-  });
-  let settled = false;
-  const finish = (error?: Error) => {
-    if (settled) return;
-    settled = true;
+  } finally {
     session.client.end();
-    error ? deferred.reject(error) : deferred.resolve();
-  };
-  destination.once("close", () => finish());
-  destination.once("error", finish);
-  source.once("error", finish);
-  source.pipe(destination);
-  return deferred.promise;
+  }
 }
 
 export async function downloadFile(config: SshConfig, path: string) {
