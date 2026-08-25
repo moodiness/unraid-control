@@ -6,6 +6,7 @@ import {
 } from "node:crypto";
 import {
   appendFile,
+  link,
   mkdir,
   readFile,
   rename,
@@ -76,10 +77,6 @@ const webDir = resolve(
   dirname(fileURLToPath(import.meta.url)),
   "../../web/dist",
 );
-const localAuth = createLocalAuth(
-  process.env.LOCAL_AUTH_PASSWORD ?? "",
-  await encryptionKey(),
-);
 
 const ServerInput = z.object({
   name: z.string().trim().min(1).max(48),
@@ -120,24 +117,58 @@ const canonicalOrigin = (value: string) => new URL(value).origin;
 const endpointFor = (config: ServerConfig) =>
   `${normalizeBaseUrl(config.baseUrl)}/graphql`;
 
-async function encryptionKey(): Promise<Buffer> {
+function decodeEncryptionKey(value: string, source: string) {
+  const decoded = Buffer.from(
+    value,
+    /^[a-f\d]{64}$/i.test(value) ? "hex" : "base64",
+  );
+  if (decoded.length !== 32)
+    throw new Error(`${source} must encode exactly 32 bytes`);
+  return decoded;
+}
+
+async function loadEncryptionKey(): Promise<Buffer> {
   await mkdir(dataDir, { recursive: true });
   const fromEnv = process.env.ARRAY_ENCRYPTION_KEY?.trim();
-  if (fromEnv) {
-    const decoded = Buffer.from(
-      fromEnv,
-      /^[a-f\d]{64}$/i.test(fromEnv) ? "hex" : "base64",
-    );
-    if (decoded.length !== 32)
-      throw new Error("ARRAY_ENCRYPTION_KEY must encode exactly 32 bytes");
-    return decoded;
+  if (fromEnv) return decodeEncryptionKey(fromEnv, "ARRAY_ENCRYPTION_KEY");
+
+  const readPersistedKey = async () =>
+    decodeEncryptionKey((await readFile(keyFile, "utf8")).trim(), ".array-key");
+  try {
+    return await readPersistedKey();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  if (existsSync(keyFile))
-    return Buffer.from((await readFile(keyFile, "utf8")).trim(), "base64");
+
   const key = randomBytes(32);
-  await writeFile(keyFile, key.toString("base64"), { mode: 0o600 });
-  return key;
+  const temporaryFile = `${keyFile}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryFile, key.toString("base64"), {
+      flag: "wx",
+      mode: 0o600,
+      flush: true,
+    });
+    try {
+      await link(temporaryFile, keyFile);
+      return key;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      return await readPersistedKey();
+    }
+  } finally {
+    await rm(temporaryFile, { force: true });
+  }
 }
+
+let encryptionKeyPromise: Promise<Buffer> | undefined;
+function encryptionKey() {
+  encryptionKeyPromise ??= loadEncryptionKey();
+  return encryptionKeyPromise;
+}
+const localAuth = createLocalAuth(
+  process.env.LOCAL_AUTH_PASSWORD ?? "",
+  await encryptionKey(),
+);
 
 async function saveStore(store: ServerStore) {
   const key = await encryptionKey();
@@ -762,7 +793,29 @@ const app = express();
 app.set("trust proxy", process.env.TRUST_PROXY === "true" ? 1 : false);
 app.disable("x-powered-by");
 app.use(
-  helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }),
+  helmet({
+    contentSecurityPolicy: {
+      useDefaults: false,
+      directives: {
+        defaultSrc: ["'self'"],
+        baseUri: ["'none'"],
+        connectSrc: ["'self'"],
+        fontSrc: ["'self'"],
+        formAction: ["'self'"],
+        frameAncestors: ["'self'"],
+        frameSrc: ["'none'"],
+        imgSrc: ["'self'", "data:", "http:", "https:"],
+        manifestSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        scriptSrc: ["'self'"],
+        scriptSrcAttr: ["'none'"],
+        styleSrc: ["'self'"],
+        styleSrcAttr: ["'unsafe-inline'"],
+        workerSrc: ["'self'"],
+      },
+    },
+    crossOriginEmbedderPolicy: false,
+  }),
 );
 app.use(express.json({ limit: "32kb", type: "application/json" }));
 
